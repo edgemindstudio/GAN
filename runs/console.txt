@@ -1,0 +1,19 @@
+=== GenCyberSynth Eval ===
+model: ConditionalDCGAN | seed: 42
+splits: train=USTC-TFC2016_malware/train_data.npy | val=USTC-TFC2016_malware/(split of test_data.npy) | test=USTC-TFC2016_malware/(split of test_data.npy)
+synth:  artifacts/gan/synthetic | fid_cap: 200
+
+Generative: FID=386.622 | cFID=409.291 | JS=0.531 | KL=4.450 | Div=0.013
+Downstream (R):  Acc=0.9558 | F1=0.9562 | BalAcc=0.9562 | AUPRC=0.9829 | R@1%FPR=0.9412 | ECE=0.0074 | Brier=0.0643
+Downstream (R+S):Acc=0.9516 | F1=0.9524 | BalAcc=0.9519 | AUPRC=0.9826 | R@1%FPR=0.9332 | ECE=0.0134 | Brier=0.0697
+Δ (R+S − R):     Acc=-0.0042 | F1=-0.0038 | BalAcc=-0.0043 | AUPRC=-0.0003 | R@1%FPR=-0.0081 | ECE=0.0061 | Brier=0.0053
+Model: ConditionalDCGAN   Seed: 42
+Counts → train:81000  val:4500  test:4500  synth:None
+Generative → FID(macro): None  cFID(macro): None  JS: None  KL: None  Div: None
+Utility R   → acc: 0.9606666666666667  bal_acc: 0.9611282725655772  macro_f1: 0.9609563072642495
+Utility R+S → acc: None  bal_acc: None  macro_f1: None
+Model: ConditionalDCGAN   Seed: 42
+Counts → train:81000  val:4500  test:4500  synth:225
+Generative → FID(macro): 386.62172463466806  cFID(macro): 409.2905591934956  JS: 0.5312808112611855  KL: 4.449742072540741  Div: 0.013039198704063892
+Utility R   → acc: 0.9595555555555556  bal_acc: 0.9600268066545712  macro_f1: 0.9599206571165801
+Utility R+S → acc: 0.9546666666666667  bal_acc: 0.9554850459074845  macro_f1: 0.9551896195708885
