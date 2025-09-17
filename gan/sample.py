@@ -1,441 +1,262 @@
 # gan/sample.py
-
 """
-Sampling utilities for the Conditional DCGAN.
+Sampling utilities + unified-CLI synth entrypoint for the Conditional DCGAN.
 
-Features
---------
-- Loads generator architecture via `gan.models.build_models` and weights from a checkpoint.
-- Generates synthetic samples either:
-    * balanced: N samples per class, or
-    * custom: total count split across a subset / explicit per-class counts.
-- Saves per-class `.npy` arrays for traceability, and an optional preview grid `.png`.
-- Outputs a small metadata JSON alongside samples for reproducibility.
+What this provides
+------------------
+- Rebuild generator via `gan.models.build_models(...)` and (optionally) load weights.
+- Generate synthetic samples either via:
+    * Unified Orchestrator: `synth(cfg, output_root, seed)` → PNGs + manifest, or
+    * (optionally) small preview via `save_grid_from_generator(...)`.
+- Saves per-class PNGs in {output_root}/{class}/{seed}/gan_XXXXX.png.
 
-Examples
---------
-# Balanced: 1000 samples per class, save to default artifacts dir
-python -m gan.sample --samples-per-class 1000
-
-# Total 5000 samples, balanced across all 9 classes
-python -m gan.sample --num-samples 5000 --balanced
-
-# Only classes 0,1,3 with custom counts (e.g., 100,200,50)
-python -m gan.sample --per-class 0:100 1:200 3:50
-
-# Custom weights path and preview grid
-python -m gan.sample --weights ./artifacts/checkpoints/generator_best.h5 --grid 9 20
-
-Notes
------
-- Generator is assumed to output in [-1, 1] (tanh). This script rescales to [0,1].
-- `config.yaml` must define IMG_SHAPE, NUM_CLASSES, LATENT_DIM (or they fall back to defaults).
+Conventions
+-----------
+- Generator outputs tanh in [-1, 1]; we rescale to [0, 1] for PNGs.
+- Config keys supported (with fallbacks): IMG_SHAPE, NUM_CLASSES, LATENT_DIM, LR, BETA_1.
 """
 
 from __future__ import annotations
 
-import os
-import sys
-import json
-import math
-import argparse
 from pathlib import Path
-from datetime import datetime
+from typing import Optional, Tuple, List, Dict
+
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from PIL import Image
 
-from typing import Optional
-# Local imports
 from gan.models import build_models
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def set_seeds(seed: int = 42):
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-
-def enable_gpu_memory_growth():
-    gpus = tf.config.list_physical_devices("GPU")
-    if not gpus:
-        return
-    try:
-        for g in gpus:
-            tf.config.experimental.set_memory_growth(g, True)
-    except Exception:
-        pass
-
-def now_ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def log(msg: str):
-    print(f"[{now_ts()}] {msg}")
-
-def make_dirs(root: Path):
-    (root / "artifacts" / "samples").mkdir(parents=True, exist_ok=True)
-    (root / "artifacts" / "checkpoints").mkdir(parents=True, exist_ok=True)
-    (root / "artifacts" / "metrics").mkdir(parents=True, exist_ok=True)
-    (root / "logs").mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# Parsing helpers
+# Small helpers
 # -----------------------------
-def parse_per_class(arg_list: list[str]) -> dict[int, int]:
-    """
-    Parse items like ["0:100", "3:50"] -> {0:100, 3:50}
-    """
-    out: dict[int, int] = {}
-    for item in arg_list:
-        try:
-            k, v = item.split(":")
-            k, v = int(k), int(v)
-            if v <= 0:
-                raise ValueError
-            out[k] = v
-        except Exception:
-            raise argparse.ArgumentTypeError(
-                f"Invalid --per-class entry '{item}'. Use 'label:count' with positive count."
-            )
-    return out
+def _cfg_get(cfg: dict, dotted: str, default=None):
+    cur = cfg
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
 
-def parse_classes(arg_list: list[str]) -> list[int]:
-    try:
-        return [int(x) for x in arg_list]
-    except Exception:
-        raise argparse.ArgumentTypeError("Invalid --classes entries; must be integers.")
 
-# -----------------------------
-# Latent sampling
-# -----------------------------
-def sample_latents(n: int, dim: int, truncation: float | None = None) -> np.ndarray:
-    """
-    Sample latent vectors. If `truncation` is provided (>0), clip to [-t, t].
-    """
-    z = np.random.normal(0.0, 1.0, size=(n, dim)).astype(np.float32)
-    if truncation is not None and truncation > 0:
-        z = np.clip(z, -float(truncation), float(truncation))
-    return z
+def _to_uint8(img01: np.ndarray) -> np.ndarray:
+    return np.clip(np.round(img01 * 255.0), 0, 255).astype(np.uint8)
+
+
+def _save_png(img01: np.ndarray, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    x = img01
+    if x.ndim == 3 and x.shape[-1] == 1:
+        x = x[..., 0]
+        mode = "L"
+    elif x.ndim == 3 and x.shape[-1] == 3:
+        mode = "RGB"
+    else:
+        x = x.squeeze()
+        mode = "L"
+    Image.fromarray(_to_uint8(x), mode=mode).save(out_path)
+
+
+def _latents(n: int, dim: int, seed: Optional[int] = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, 1.0, size=(n, dim)).astype(np.float32)
+
 
 # -----------------------------
-# Image utilities
+# Checkpoint loading
 # -----------------------------
-def to_uint8(img01: np.ndarray) -> np.ndarray:
-    """Convert [0,1] float to uint8 [0,255] safely."""
-    return np.clip(np.rint(img01 * 255.0), 0, 255).astype(np.uint8)
-
-def save_grid(
-    images01: np.ndarray,
-    img_shape: tuple[int, int, int],
-    rows: int,
-    cols: int,
-    out_path: Path,
-    titles: list[str] | None = None,
-):
-    """
-    Save a grid of images in [0,1]. Supports 1 or 3 channels.
-    """
-    H, W, C = img_shape
-    n = min(images01.shape[0], rows * cols)
-    plt.figure(figsize=(cols * 1.6, rows * 1.6))
-    for i in range(n):
-        ax = plt.subplot(rows, cols, i + 1)
-        im = images01[i].reshape(H, W, C)
-        if C == 1:
-            plt.imshow(im.squeeze(), cmap="gray", vmin=0.0, vmax=1.0)
-        else:
-            plt.imshow(np.clip(im, 0.0, 1.0))
-        if titles:
-            ax.set_title(titles[i], fontsize=8)
-        ax.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-# -----------------------------
-# Build & load generator
-# -----------------------------
-def build_and_load_generator(
-    latent_dim: int,
+def load_g_from_checkpoints(
+    ckpt_dir: Path | str,
+    *,
+    img_shape: Tuple[int, int, int],
     num_classes: int,
-    img_shape: tuple[int, int, int],
-    weights_path: Path | None,
+    latent_dim: int,
     lr: float = 2e-4,
     beta_1: float = 0.5,
 ) -> tf.keras.Model:
     """
-    Reconstruct generator architecture via gan.models.build_models and load weights if provided.
+    Instantiate the conditional generator and load weights from G_best→G_last.
+    If no compatible checkpoint exists or loading fails, returns random-initialized G.
     """
-    models_dict = build_models(
-        latent_dim=latent_dim,
-        num_classes=num_classes,
-        img_shape=img_shape,
-        lr=lr,
-        beta_1=beta_1,
-    )
-    G = models_dict["generator"]
-    if weights_path is not None and weights_path.exists():
-        G.load_weights(str(weights_path))
-        log(f"Loaded generator weights: {weights_path}")
-    else:
-        if weights_path is not None:
-            log(f"WARNING: weights not found at {weights_path}. Continuing with untrained generator.")
-        else:
-            log("WARNING: no weights path provided. Continuing with untrained generator.")
+    ckpt_dir = Path(ckpt_dir)
+    models = build_models(latent_dim=latent_dim, num_classes=num_classes, img_shape=img_shape, lr=lr, beta_1=beta_1)
+    G: tf.keras.Model = models["generator"]
+
+    # Build weights by a dummy forward pass (helps some Keras versions)
+    H, W, C = img_shape
+    dummy_z = tf.zeros((1, latent_dim), dtype=tf.float32)
+    dummy_y = tf.one_hot([0], depth=num_classes, dtype=tf.float32)
+    _ = G([dummy_z, dummy_y], training=False)
+
+    best = ckpt_dir / "G_best.weights.h5"
+    last = ckpt_dir / "G_last.weights.h5"
+    to_load = best if best.exists() else last
+
+    if not to_load.exists():
+        print(f"[ckpt][warn] no GAN generator checkpoint in {ckpt_dir}; using random weights.")
+        return G
+
+    try:
+        G.load_weights(str(to_load))
+        print(f"[ckpt] Loaded {to_load.name}")
+    except Exception as e:
+        print(f"[ckpt][warn] failed to load {to_load.name}: {e}\n→ continuing with random weights.")
     return G
 
+
 # -----------------------------
-# Main sampling logic
+# Core generation
 # -----------------------------
-def generate_for_classes(
+def _generate_batch_01(
     G: tf.keras.Model,
+    *,
+    class_id: int,
+    count: int,
     latent_dim: int,
-    img_shape: tuple[int, int, int],
-    class_counts: dict[int, int],
     num_classes: int,
-    save_dir: Path,
-    save_per_class_npy: bool = True,
-    truncation: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    seed: Optional[int],
+) -> np.ndarray:
     """
-    Generate per-class images and return concatenated arrays:
-        x_synth_01: (N, H, W, C) in [0,1]
-        y_synth_oh: (N, num_classes) one-hot
-    Also optionally saves per-class .npy dumps for traceability.
+    Generate `count` images for a single class id. Returns (count, H, W, C) in [0,1].
+    """
+    z = _latents(count, latent_dim, seed=seed)
+    y = tf.keras.utils.to_categorical(np.full((count,), class_id), num_classes=num_classes).astype(np.float32)
+    g = G.predict([z, y], verbose=0)               # [-1, 1] from tanh
+    g01 = np.clip((g + 1.0) / 2.0, 0.0, 1.0)       # → [0, 1]
+    return g01.astype(np.float32, copy=False)
+
+
+# -----------------------------
+# Public helper: quick preview grid
+# -----------------------------
+def save_grid_from_generator(
+    generator: tf.keras.Model,
+    num_classes: int,
+    img_shape: Tuple[int, int, int],
+    latent_dim: int,
+    n_per_class: int = 1,
+    path: Path | str = "artifacts/gan/summaries/preview.png",
+    seed: Optional[int] = 42,
+) -> Path:
+    """
+    Generate a class-conditioned preview grid and save to disk.
+
+    Layout: rows = classes (0..K-1), cols = n_per_class
     """
     H, W, C = img_shape
-    xs, ys = [], []
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    for cls, count in class_counts.items():
-        if cls < 0 or cls >= num_classes:
-            raise ValueError(f"Class {cls} is out of range [0, {num_classes-1}]")
-        if count <= 0:
-            continue
+    rng = np.random.default_rng(seed)
+    imgs = []
+    for k in range(num_classes):
+        z = rng.normal(0.0, 1.0, size=(n_per_class, latent_dim)).astype(np.float32)
+        y = tf.keras.utils.to_categorical(np.full((n_per_class,), k), num_classes=num_classes).astype(np.float32)
+        g = generator.predict([z, y], verbose=0)          # [-1, 1]
+        g01 = np.clip((g + 1.0) / 2.0, 0.0, 1.0)          # [0, 1]
+        imgs.append(g01)
+    imgs = np.concatenate(imgs, axis=0)                   # (K*n_per_class, H, W, C)
 
-        z = sample_latents(count, latent_dim, truncation=truncation)
-        y = tf.keras.utils.to_categorical(np.full((count, 1), cls), num_classes).astype(np.float32)
-        g = G.predict([z, y], verbose=0)              # expected in [-1,1]
-        g01 = np.clip((g + 1.0) / 2.0, 0.0, 1.0)      # -> [0,1]
+    rows, cols = num_classes, n_per_class
+    fig, axes = plt.subplots(rows, cols, figsize=(1.6 * cols, 1.6 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
 
-        xs.append(g01.reshape(-1, H, W, C))
-        ys.append(y)
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            ax = axes[r, c]
+            img = imgs[idx]; idx += 1
+            if C == 1:
+                ax.imshow(img[:, :, 0], cmap="gray", vmin=0.0, vmax=1.0)
+            else:
+                ax.imshow(img, vmin=0.0, vmax=1.0)
+            ax.set_xticks([]); ax.set_yticks([])
+            if c == 0:
+                ax.set_ylabel(f"C{r}", rotation=0, labelpad=10, fontsize=9, va="center")
 
-        if save_per_class_npy:
-            np.save(save_dir / f"gen_class_{cls}.npy", g01)
-            np.save(save_dir / f"labels_class_{cls}.npy", np.full((count,), cls, dtype=np.int32))
-            log(f"Saved class {cls} -> {count} samples to {save_dir}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    return path
 
-    if not xs:
-        return np.empty((0, H, W, C), dtype=np.float32), np.empty((0, num_classes), dtype=np.float32)
-
-    x_synth = np.concatenate(xs, axis=0)
-    y_synth = np.concatenate(ys, axis=0)
-    return x_synth, y_synth
 
 # -----------------------------
-# CLI
+# Unified Orchestrator entrypoint
 # -----------------------------
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Sample synthetic data from a trained Conditional DCGAN.")
-    parser.add_argument("--config", type=str, default=str(Path(__file__).resolve().parents[1] / "config.yaml"),
-                        help="Path to config.yaml")
-    parser.add_argument("--weights", type=str, default=None,
-                        help="Path to generator weights (defaults to artifacts/checkpoints/generator_best.h5)")
-    # Sampling modes
-    parser.add_argument("--samples-per-class", type=int, default=None,
-                        help="If set, generate this many samples per class (balanced).")
-    parser.add_argument("--num-samples", type=int, default=None,
-                        help="Total number of samples to generate. Requires --balanced or --classes.")
-    parser.add_argument("--balanced", action="store_true",
-                        help="When using --num-samples, split evenly across classes (or selected classes).")
-    parser.add_argument("--classes", nargs="+", default=None,
-                        help="Subset of class IDs to sample (e.g., --classes 0 1 3). Defaults to all classes.")
-    parser.add_argument("--per-class", nargs="+", default=None,
-                        help="Explicit per-class counts, e.g., --per-class 0:100 2:50")
+def synth(cfg: dict, output_root: str, seed: int = 42) -> Dict:
+    """
+    Generate S PNGs/class into {output_root}/{class}/{seed}/... and return a manifest.
 
-    # Output & preview
-    parser.add_argument("--outdir", type=str, default=None,
-                        help="Override output directory (default: artifacts/samples)")
-    parser.add_argument("--tag", type=str, default=None,
-                        help="Optional subfolder tag under samples/, e.g., 'exp1'")
-    parser.add_argument("--grid", nargs=2, type=int, default=None,
-                        help="Save a preview grid: ROWS COLS, e.g., --grid 6 9")
-    parser.add_argument("--grid-path", type=str, default=None,
-                        help="Override grid output path (default: samples/<tag>/preview_grid.png)")
-    parser.add_argument("--no-save-per-class", action="store_true",
-                        help="Do not save per-class .npy dumps (still returns arrays).")
+    Expects (optionally) generator checkpoints at:
+      artifacts/gan/checkpoints/{G_best,G_last}.weights.h5
+    """
+    # Resolve shapes & counts (support legacy spellings)
+    H, W, C = tuple(_cfg_get(cfg, "IMG_SHAPE", _cfg_get(cfg, "img.shape", (40, 40, 1))))
+    K = int(_cfg_get(cfg, "NUM_CLASSES", _cfg_get(cfg, "num_classes", 9)))
+    LATENT_DIM = int(_cfg_get(cfg, "LATENT_DIM", _cfg_get(cfg, "gan.latent_dim", 100)))
+    S = int(_cfg_get(cfg, "SAMPLES_PER_CLASS", _cfg_get(cfg, "samples_per_class", 25)))
+    LR = float(_cfg_get(cfg, "LR", _cfg_get(cfg, "gan.lr", 2e-4)))
+    BETA_1 = float(_cfg_get(cfg, "BETA_1", _cfg_get(cfg, "gan.beta_1", 0.5)))
 
-    # Sampling behavior
-    parser.add_argument("--truncation", type=float, default=None,
-                        help="Clip latent z to [-t, t]. If omitted, use full N(0,1).")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility.")
-    args = parser.parse_args(argv)
+    artifacts_root = Path(_cfg_get(cfg, "paths.artifacts", "artifacts"))
+    ckpt_dir = Path(_cfg_get(cfg, "ARTIFACTS.gan_checkpoints",
+                             artifacts_root / "gan" / "checkpoints"))
 
-    # Setup
-    root = Path(__file__).resolve().parents[1]
-    make_dirs(root)
-    set_seeds(args.seed)
-    enable_gpu_memory_growth()
+    # Seeds for reproducibility
+    np.random.seed(int(seed))
+    tf.keras.utils.set_random_seed(int(seed))
 
-    # Config
-    import yaml
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    IMG_SHAPE   = tuple(cfg.get("IMG_SHAPE", (40, 40, 1)))
-    NUM_CLASSES = int(cfg.get("NUM_CLASSES", 9))
-    LATENT_DIM  = int(cfg.get("LATENT_DIM", 100))
-    LR          = float(cfg.get("LR", 2e-4))
-    BETA_1      = float(cfg.get("BETA_1", 0.5))
-
-    # Output dirs
-    samples_root = Path(args.outdir) if args.outdir else (root / "artifacts" / "samples")
-    if args.tag:
-        samples_dir = samples_root / args.tag
-    else:
-        # timestamped folder to avoid accidental overwrite
-        samples_dir = samples_root / datetime.now().strftime("%Y%m%d-%H%M%S")
-    samples_dir.mkdir(parents=True, exist_ok=True)
-
-    # Weights
-    weights_path = Path(args.weights) if args.weights else (root / "artifacts" / "checkpoints" / "generator_best.h5")
-
-    # Build + load generator
-    log("Building generator...")
-    G = build_and_load_generator(
+    # Build + (optionally) load generator
+    G = load_g_from_checkpoints(
+        ckpt_dir,
+        img_shape=(H, W, C),
+        num_classes=K,
         latent_dim=LATENT_DIM,
-        num_classes=NUM_CLASSES,
-        img_shape=IMG_SHAPE,
-        weights_path=weights_path,
         lr=LR,
         beta_1=BETA_1,
     )
 
-    # Decide class counts
-    if args.per_class:
-        class_counts = parse_per_class(args.per_class)
-        selected = sorted(class_counts.keys())
-    else:
-        selected = parse_classes(args.classes) if args.classes else list(range(NUM_CLASSES))
-        if args.samples_per_class is not None:
-            class_counts = {c: int(args.samples_per_class) for c in selected}
-        elif args.num_samples is not None:
-            if not args.balanced and len(selected) == 1:
-                class_counts = {selected[0]: int(args.num_samples)}
-            elif args.balanced:
-                per = int(math.floor(args.num_samples / len(selected)))
-                if per <= 0:
-                    raise ValueError("num-samples too small for the number of selected classes.")
-                class_counts = {c: per for c in selected}
-            else:
-                raise ValueError("When using --num-samples, you must pass --balanced or a single class via --classes.")
-        else:
-            # default: 1000 per class across all classes
-            class_counts = {c: 1000 for c in selected}
-            log("No counts provided; defaulting to 1000 per class.")
+    out_root = Path(output_root)
+    per_class_counts: Dict[str, int] = {str(k): 0 for k in range(K)}
+    paths: List[Dict] = []
 
-    log(f"Sampling plan: {class_counts}")
+    # Generate per class
+    for k in range(K):
+        imgs01 = _generate_batch_01(
+            G,
+            class_id=k,
+            count=S,
+            latent_dim=LATENT_DIM,
+            num_classes=K,
+            seed=seed,
+        )  # (S, H, W, C)
 
-    # Generate
-    x_synth, y_synth = generate_for_classes(
-        G=G,
-        latent_dim=LATENT_DIM,
-        img_shape=IMG_SHAPE,
-        class_counts=class_counts,
-        num_classes=NUM_CLASSES,
-        save_dir=samples_dir,
-        save_per_class_npy=not args.no_save_per_class,
-        truncation=args.truncation,
-    )
-    log(f"Generated synthetic arrays: x {x_synth.shape}, y {y_synth.shape}")
+        cls_dir = out_root / str(k) / str(seed)
+        cls_dir.mkdir(parents=True, exist_ok=True)
+        for j in range(S):
+            p = cls_dir / f"gan_{j:05d}.png"
+            _save_png(imgs01[j], p)
+            paths.append({"path": str(p), "label": int(k)})
+        per_class_counts[str(k)] = int(S)
 
-    # Save combined arrays for convenience
-    np.save(samples_dir / "x_synth.npy", x_synth)
-    np.save(samples_dir / "y_synth.npy", y_synth)
-
-    # Optional grid
-    if args.grid:
-        rows, cols = args.grid
-        n = min(rows * cols, x_synth.shape[0])
-        titles = None
-        # optional: annotate with class ids in the grid
-        try:
-            y_int = np.argmax(y_synth, axis=1)
-            titles = [str(y_int[i]) for i in range(n)]
-        except Exception:
-            pass
-        grid_path = Path(args.grid_path) if args.grid_path else (samples_dir / "preview_grid.png")
-        save_grid(x_synth[:n], IMG_SHAPE, rows, cols, grid_path, titles=titles)
-        log(f"Saved preview grid to {grid_path}")
-
-    # Metadata for reproducibility
-    meta = {
-        "timestamp": now_ts(),
-        "img_shape": IMG_SHAPE,
-        "num_classes": NUM_CLASSES,
-        "latent_dim": LATENT_DIM,
-        "weights": str(weights_path),
-        "classes": sorted(list(class_counts.keys())),
-        "class_counts": class_counts,
-        "seed": args.seed,
-        "truncation": args.truncation,
-        "outdir": str(samples_dir),
-        "x_synth_path": str(samples_dir / "x_synth.npy"),
-        "y_synth_path": str(samples_dir / "y_synth.npy"),
+    manifest = {
+        "dataset": _cfg_get(cfg, "data.root", _cfg_get(cfg, "DATA_DIR", "data")),
+        "seed": int(seed),
+        "per_class_counts": per_class_counts,
+        "paths": paths,
     }
-    with open(samples_dir / "metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
-    log(f"Wrote metadata.json to {samples_dir}")
+    return manifest
 
-    log("Done.")
-    return 0
 
-def save_grid_from_generator(
-    generator: tf.keras.Model,
-    num_classes: int,
-    latent_dim: int,
-    *,
-    n: int = 9,
-    path: Optional[Path | str] = None,
-    per_class: bool = True,
-    seed: int = 42,
-):
-    """
-    Generate a 1 x n preview grid from a conditional generator and save to disk.
-
-    - Assumes generator outputs [-1, 1]; rescales to [0, 1].
-    - Reuses the existing `save_grid(images01, img_shape, rows, cols, out_path, titles=None)`
-      defined earlier in this file.
-    """
-    rng = np.random.default_rng(seed)
-    n = int(max(1, n))
-
-    # sample noise
-    z = rng.normal(0.0, 1.0, size=(n, latent_dim)).astype(np.float32)
-
-    # choose labels
-    if per_class:
-        labels = np.arange(n) % num_classes
-    else:
-        labels = rng.integers(low=0, high=num_classes, size=n)
-    y = tf.keras.utils.to_categorical(labels, num_classes=num_classes).astype(np.float32)
-
-    # generate images [-1, 1] -> [0, 1]
-    imgs = generator.predict([z, y], verbose=0)
-    imgs01 = np.clip((imgs + 1.0) / 2.0, 0.0, 1.0)
-
-    out_path = Path(path) if path is not None else Path("preview.png")
-    # reuse your existing grid saver
-    save_grid(
-        images01=imgs01,
-        img_shape=imgs01.shape[1:],  # (H, W, C)
-        rows=1,
-        cols=n,
-        out_path=out_path,
-        titles=[f"class {int(l)}" for l in labels],
-    )
-    return out_path
-
-if __name__ == "__main__":
-    sys.exit(main())
+__all__ = [
+    "load_g_from_checkpoints",
+    "save_grid_from_generator",
+    "synth",
+]

@@ -1,5 +1,4 @@
 # gan/models.py
-
 """
 Lightweight model builders for the Conditional DCGAN.
 
@@ -13,13 +12,13 @@ Notes
 -----
 - Compatible with Keras 3 (no legacy optimizers).
 - LeakyReLU uses `negative_slope=0.2` to avoid deprecation warnings.
-- Generator outputs images in [-1, 1] (tanh), matching the training loop.
+- Generator outputs images in [-1, 1] (tanh), matching typical DCGAN training.
 """
 
 from __future__ import annotations
 
 from typing import Dict, Tuple
-import numpy as np
+
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
@@ -30,9 +29,11 @@ Adam = tf.keras.optimizers.Adam
 # -------------------------------------------------
 # Generator
 # -------------------------------------------------
-def build_generator(latent_dim: int = 100,
-                    num_classes: int = 9,
-                    img_shape: Tuple[int, int, int] = (40, 40, 1)) -> tf.keras.Model:
+def build_generator(
+    latent_dim: int = 100,
+    num_classes: int = 9,
+    img_shape: Tuple[int, int, int] = (40, 40, 1),
+) -> tf.keras.Model:
     """
     Conditional generator: concatenates a spatially-projected label map to the noise feature map.
     Output: tanh -> [-1, 1]
@@ -48,14 +49,14 @@ def build_generator(latent_dim: int = 100,
     x = layers.LeakyReLU(negative_slope=0.2)(x)
     x = layers.Reshape((5, 5, 256))(x)
 
-    # Project label into a single channel map at the same spatial size
+    # Project label into a single-channel map at the same spatial size
     y_map = layers.Dense(5 * 5 * 1, use_bias=False)(y_in)
     y_map = layers.Reshape((5, 5, 1))(y_map)
 
     # Concatenate noise feature map with label map
     x = layers.Concatenate(axis=-1)([x, y_map])  # (5,5,257)
 
-    # Upsampling blocks to reach (40,40)
+    # Upsampling blocks to reach (H, W)
     x = layers.UpSampling2D()(x)  # 10x10
     x = layers.Conv2D(128, 3, padding="same", use_bias=False, name="gen_conv1")(x)
     x = layers.BatchNormalization()(x)
@@ -67,6 +68,7 @@ def build_generator(latent_dim: int = 100,
     x = layers.LeakyReLU(negative_slope=0.2)(x)
 
     x = layers.UpSampling2D()(x)  # 40x40
+    # Final conv to desired channels with tanh in [-1, 1]
     out = layers.Conv2D(C, 3, padding="same", activation="tanh", use_bias=False, name="gen_out")(x)
 
     return models.Model([z_in, y_in], out, name="Conditional_Generator")
@@ -75,22 +77,25 @@ def build_generator(latent_dim: int = 100,
 # -------------------------------------------------
 # Discriminator
 # -------------------------------------------------
-def build_discriminator(img_shape: Tuple[int, int, int] = (40, 40, 1),
-                        num_classes: int = 9) -> tf.keras.Model:
+def build_discriminator(
+    img_shape: Tuple[int, int, int] = (40, 40, 1),
+    num_classes: int = 9,
+) -> tf.keras.Model:
     """
     Conditional discriminator: concatenates the input image with a label-projected map.
-    Output: single sigmoid logit (real/fake).
+    Output: single sigmoid probability (real/fake).
     """
     H, W, C = img_shape
 
     x_in = layers.Input(shape=img_shape, name="x")
     y_in = layers.Input(shape=(num_classes,), name="y_onehot")
 
-    # Project label into an image-sized map and concatenate as an extra channel
-    y_map = layers.Dense(H * W * C)(y_in)
-    y_map = layers.Reshape(img_shape)(y_map)
+    # Project label into a SINGLE-CHANNEL spatial map and concatenate as an extra channel
+    # (keeps conditioning consistent for both grayscale and RGB inputs)
+    y_map = layers.Dense(H * W, use_bias=False)(y_in)
+    y_map = layers.Reshape((H, W, 1))(y_map)
 
-    xy = layers.Concatenate(axis=-1)([x_in, y_map])  # (H,W,C+1)
+    xy = layers.Concatenate(axis=-1)([x_in, y_map])  # (H, W, C+1)
 
     x = layers.Conv2D(64, 4, strides=2, padding="same", name="disc_conv1")(xy)
     x = layers.LeakyReLU(negative_slope=0.2)(x)
@@ -110,11 +115,13 @@ def build_discriminator(img_shape: Tuple[int, int, int] = (40, 40, 1),
 # -------------------------------------------------
 # Builder for D, G, and combined GAN
 # -------------------------------------------------
-def build_models(latent_dim: int,
-                 num_classes: int,
-                 img_shape: Tuple[int, int, int],
-                 lr: float = 2e-4,
-                 beta_1: float = 0.5) -> Dict[str, tf.keras.Model]:
+def build_models(
+    latent_dim: int,
+    num_classes: int,
+    img_shape: Tuple[int, int, int],
+    lr: float = 2e-4,
+    beta_1: float = 0.5,
+) -> Dict[str, tf.keras.Model]:
     """
     Create and compile:
         - Discriminator D (trainable alone, binary_crossentropy)
@@ -143,3 +150,5 @@ def build_models(latent_dim: int,
 
     return {"generator": G, "discriminator": D, "gan": GAN}
 
+
+__all__ = ["build_generator", "build_discriminator", "build_models"]
